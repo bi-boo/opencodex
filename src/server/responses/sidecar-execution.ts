@@ -29,8 +29,7 @@ import {
   failoverAccountSnapshot,
 } from "../../oauth/generic-account-failover";
 import { classifyKiroRefusal } from "../../adapters/kiro-refusal";
-import { safeAntigravityHttpErrorMessage } from "../../adapters/google-errors";
-import { markAccountNeedsReauthIfGeneration } from "../../oauth/store";
+import { isNonReplayableResponse } from "../../lib/upstream-retry";
 import { noteKiroMonthlyRefusal, noteKiroServedSuccess } from "../../providers/kiro-usage";
 import { persistKiroAccountState } from "../../providers/kiro-account-state-disk";
 import { readDisplaySafeErrorText } from "./core-errors";
@@ -48,7 +47,7 @@ import { recordAdapterReasoning, recordAdapterTier } from "../request-log";
 import { normalizeLogConversationId } from "../request-log-conversation";
 import { rememberResponseState } from "../../responses/state";
 import { trackStreamLifetime } from "../lifecycle";
-import { hasAntigravityValidationRefusalMarker } from "./antigravity-validation-refusal";
+import { isAntigravityRawValidationRefusal } from "./antigravity-validation-refusal";
 
 /** One responsibility of the Responses request pipeline; state owners are explicit. */
 export async function executeResponsesSidecars(
@@ -92,6 +91,8 @@ export async function executeResponsesSidecars(
   sendBudgetState: Pick<ResponsesSendBudget, "reserveCredentialHop" | "adapterDispatchBudget" | "pendingHopPermit" | "noteAdapterPhysicalSend">,
 ) {
   const { config, options, logCtx } = requestContext;
+  const antigravityPoolActivated = requestState.route.providerName === "google-antigravity"
+    && isGenericOAuthFailoverEnabled(config, requestState.route.providerName);
   const {
     applyFailoverSnapshot,
     anthropicSessionKey,
@@ -201,24 +202,12 @@ export async function executeResponsesSidecars(
       && !antigravityValidationResponse && originalResponse && originalResponse.status !== 429) return null;
     let antigravityVerification = false;
     if (antigravityValidationResponse) {
-      if (options.abortSignal?.aborted) return null;
-      const body = await readDisplaySafeErrorText(
-        originalResponse.clone(), options.abortSignal ?? new AbortController().signal, "",
-      );
-      if (options.abortSignal?.aborted) return null;
-      let exactMessage = false;
-      try {
-        const envelope = JSON.parse(body) as { error?: { message?: unknown } };
-        const message = envelope.error?.message;
-        exactMessage = typeof message === "string"
-          && /^(?:Please )?verify your account to continue(?: using Antigravity)?[.!]?$/i.test(message.trim());
-      } catch { /* an unparseable body cannot authorize account quarantine */ }
-      // The structured reason is authoritative. For older upstream envelopes, accept only the
-      // exact verification message in error.message; unrelated 403 text and other fields do not
-      // convict an account.
-      antigravityVerification = hasAntigravityValidationRefusalMarker(
-        safeAntigravityHttpErrorMessage(403, body),
-      ) || exactMessage;
+      if (transportState.adapter.name !== "google" || !antigravityPoolActivated
+        || options.abortSignal?.aborted || isNonReplayableResponse(originalResponse)
+        || antigravityValidationRotationAttempted
+        || transportState.genericFailovers >= transportState.genericFailoverLimit
+        || sidecarHasCommittedOutput()) return null;
+      antigravityVerification = await isAntigravityRawValidationRefusal(originalResponse, options.abortSignal);
       if (!antigravityVerification) return null;
     }
     const refusal = route.providerName === "kiro" && originalResponse
@@ -241,16 +230,7 @@ export async function executeResponsesSidecars(
       const sent = transportState.replayOAuthCredentialSnapshot;
       const failedAccountId = transportState.genericFailoverAccountId;
       if (!sent || !failedAccountId || sent.accountId !== failedAccountId) return null;
-      const poolActivated = isGenericOAuthFailoverEnabled(config, route.providerName);
-      try {
-        // Fence the durable health mark to the exact credential generation sent upstream.
-        if (!await markAccountNeedsReauthIfGeneration(
-          route.providerName, sent.accountId, sent.generation, undefined, "verify_account",
-        )) return null;
-      } catch { return null; }
-      if (options.abortSignal?.aborted || !poolActivated || antigravityValidationRotationAttempted
-        || transportState.genericFailovers >= transportState.genericFailoverLimit
-        || sidecarHasCommittedOutput()) return null;
+      if (options.abortSignal?.aborted || sidecarHasCommittedOutput()) return null;
 
       const hop = reserveCredentialHop(
         "auth-recovery",
@@ -259,7 +239,7 @@ export async function executeResponsesSidecars(
       if (!hop.allowed) return null;
       antigravityValidationRotationAttempted = true;
       const nextAccountId = rotateAntigravityAccountOnAuthRefusal(
-        poolActivated, sent.accountId, sent.generation, route.modelId,
+        antigravityPoolActivated, sent.accountId, sent.generation, route.modelId,
       );
       if (!nextAccountId) {
         hop.permit?.release();
@@ -267,7 +247,7 @@ export async function executeResponsesSidecars(
       }
       try {
         // Keep the sibling's bearer and its account-matched project together; never inherit the
-        // quarantined account's identity or project.
+        // failed account's identity or project.
         const snapshot = await failoverAccountSnapshot(route.providerName, nextAccountId);
         if (options.abortSignal?.aborted || !await applyFailoverSnapshot(snapshot, retryParsed)
           || transportState.replayOAuthCredentialSnapshot?.accountId !== nextAccountId) {
@@ -304,7 +284,8 @@ export async function executeResponsesSidecars(
     ) {
       // Intersection with the request's shared budget. The sidecar replay is dispatched by the
       // web-search/image loop and never reaches `onSendsConsumed`, so this reservation is the
-      // charge; a refusal returns null and the caller keeps the real 429 it already has.
+      // charge for other sidecars. Antigravity web search hands its reservation to the adapter
+      // physical-send owner instead; a refusal preserves the real 429.
       const hop = reserveCredentialHop(
         "auth-recovery",
         `${route.providerName}|${route.modelId}|sidecar-oauth-429`,
@@ -338,7 +319,8 @@ export async function executeResponsesSidecars(
         return null;
       }
       recoveryKind = "oauth-account-429";
-      hop.permit?.use();
+      if (canRunWebSearch && route.providerName === "google-antigravity") sendBudgetState.pendingHopPermit = hop.permit;
+      else hop.permit?.use();
     } else if (
       // Anthropic's pool is excluded from generic failover, so without this arm a 429 inside a
       // web-search or image-bridge turn was terminal even with the pool fully enabled -- while
