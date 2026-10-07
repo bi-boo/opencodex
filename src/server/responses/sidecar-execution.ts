@@ -88,7 +88,7 @@ export async function executeResponsesSidecars(
     | "notifyResponseComplete"
     | "cancelResponseCompletion"
   >,
-  sendBudgetState: Pick<ResponsesSendBudget, "reserveCredentialHop" | "adapterDispatchBudget" | "pendingHopPermit" | "noteAdapterPhysicalSend">,
+  sendBudgetState: Pick<ResponsesSendBudget, "reserveCredentialHop" | "refundableAdapterDispatchBudget" | "pendingHopPermit" | "noteAdapterPhysicalSend">,
 ) {
   const { config, options, logCtx } = requestContext;
   const antigravityPoolActivated = requestState.route.providerName === "google-antigravity"
@@ -548,7 +548,7 @@ export async function executeResponsesSidecars(
         translatorBudget,
         providerFetch: routedProviderFetch,
         ...(route.providerName === "google-antigravity" ? {
-          sendBudget: sendBudgetState.adapterDispatchBudget,
+          sendBudget: sendBudgetState.refundableAdapterDispatchBudget,
           onPhysicalSend: (send: { ordinal: number; recovery?: AttemptRecoveryKind }) =>
             sendBudgetState.noteAdapterPhysicalSend(logCtx.usageLogInputTokens, send),
         } : {}),

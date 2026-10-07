@@ -582,13 +582,27 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
         const rotated = await deps.on429(prepared.response.headers.get("retry-after"), prepared.response.headers,
           iterParsed, prepared.response);
         if (!rotated) break;
-        // Never let a broken body's cancel promise outlive the cumulative header deadline. Observe
-        // it, but proceed immediately to the rotated fetch under the SAME deadline signal.
-        try { void prepared.response.body?.cancel().catch(() => {}); } catch { /* already closed */ }
+        const retainRefusal = prepared.response.status === 403
+          && deps.incomingMeta?.providerName === "google-antigravity" && rotated.recoveryKind === "oauth-account-403";
+        // Keep the bounded refusal readable until the sibling actually returns headers.
+        // Other rotation paths retain their existing cancellation boundary.
+        if (!retainRefusal) {
+          try { void prepared.response.body?.cancel().catch(() => {}); } catch { /* already closed */ }
+        }
         adapter = rotated.adapter;
         // Stall-watchdog seam between bounded retry fetches (audit 011 B3).
         yield { type: "heartbeat" };
-        prepared = await fetchOnce(adapter, rotated.recoveryKind);
+        let replacement: IterationResponse;
+        try {
+          replacement = await fetchOnce(adapter, rotated.recoveryKind);
+        } catch (error) {
+          if (!retainRefusal || signal.aborted || headerDeadline.didExpire() || isTranslatorBudgetExceededError(error)) throw error;
+          break; // Format the original 403 safely; replacement diagnostics are not client errors.
+        }
+        if (retainRefusal) {
+          try { void prepared.response.body?.cancel().catch(() => {}); } catch { /* already closed */ }
+        }
+        prepared = replacement;
       }
 
       // Final headers have arrived. Clear only the deadline timer before ANY body read.

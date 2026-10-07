@@ -12,6 +12,8 @@ import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import * as retry from "../../src/lib/upstream-retry";
 import * as webSearch from "../../src/web-search";
+import * as adapterResolve from "../../src/server/adapter-resolve";
+import * as pacing from "../../src/providers/request-pacing";
 import { createRequestExecutionBudget } from "../../src/lib/request-execution-budget";
 
 const DAILY_API_BASE = "https://daily-cloudcode-pa.googleapis.com";
@@ -373,26 +375,53 @@ test.each(["non-replayable", "committed output", "non-Google adapter"])(
   },
 );
 
-test("iteration cleanup releases a sibling permit if construction ends before physical dispatch", async () => {
-  await seedAntigravityAccounts(2);
-  const cfg = webSearchConfig();
-  const sendBudget = budget(2);
-  const loopSpy = spyOn(webSearch, "runWithWebSearch").mockImplementation(async deps => {
-    const refusal = new Response(structuredRefusal, { status: 403 });
-    const replacement = await deps.on429?.(null, refusal.headers, deps.parsed, refusal);
-    expect(replacement?.recoveryKind).toBe("oauth-account-403");
-    expect(sendBudget.used).toBe(1);
-    expect(sendBudget.remainingBaseSends(2)).toBe(1);
-    deps.onIterationEnd?.();
-    expect(sendBudget.used).toBe(0);
-    expect(sendBudget.remainingBaseSends(2)).toBe(2);
-    return refusal;
-  });
-  try {
-    const response = await handleResponses(request(), cfg, route, { sendBudget });
-    await response.text();
-  } finally { loopSpy.mockRestore(); }
-});
+test.each(["construction", "admission", "admission cancellation"])(
+  "real web-search sibling %s failure refunds the unused send and preserves error ownership",
+  async failure => {
+    const accounts = await seedAntigravityAccounts(2);
+    const cfg = webSearchConfig();
+    const before = durableHealth();
+    const sendBudget = budget(2);
+    const abort = new AbortController();
+    const sends: Array<{ auth: string; project: string }> = [];
+    let rejected = 0;
+    installAntigravityFetchMock(({ auth, project }) => {
+      sends.push({ auth, project });
+      return new Response(structuredRefusal, { status: 403 });
+    });
+    const resolve = adapterResolve.resolveAdapter;
+    const wait = pacing.waitForProviderRequestSlot;
+    const resolveSpy = spyOn(adapterResolve, "resolveAdapter").mockImplementation((provider, ...args) => {
+      const adapter = resolve(provider, ...args);
+      if (failure === "construction" && provider.project === accounts[1]!.project) {
+        adapter.buildRequest = async () => { rejected++; throw new Error("replacement-build-canary"); };
+      }
+      return adapter;
+    });
+    const pacingSpy = spyOn(pacing, "waitForProviderRequestSlot").mockImplementation(async (name, provider, ...args) => {
+      if (failure.startsWith("admission") && provider.project === accounts[1]!.project) {
+        rejected++;
+        if (failure === "admission cancellation") abort.abort();
+        throw new Error("replacement-admission-canary");
+      }
+      return wait(name, provider, ...args);
+    });
+    try {
+      const response = await handleResponses(request(), cfg, route, { sendBudget, abortSignal: abort.signal });
+      const body = await response.text();
+      expect(rejected).toBeGreaterThan(0);
+      expect(response.status).toBe(failure === "admission cancellation" ? 499 : 403);
+      if (failure !== "admission cancellation") {
+        expect(body).toContain("Antigravity account validation required (VALIDATION_REQUIRED): validate");
+      }
+      expect(body).not.toContain("canary");
+      expect(sends).toEqual([{ auth: accounts[0]!.auth, project: accounts[0]!.project }]);
+      expect(sendBudget.used).toBe(1);
+      expect(sendBudget.remainingBaseSends(2)).toBe(1);
+      expect(durableHealth()).toEqual(before);
+    } finally { resolveSpy.mockRestore(); pacingSpy.mockRestore(); }
+  },
+);
 
 test("web-search 429 recovery still uses the sibling's identity and charges exactly two physical sends", async () => {
   const accounts = await seedAntigravityAccounts(2);

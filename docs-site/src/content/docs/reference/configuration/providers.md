@@ -1024,7 +1024,9 @@ OAuth token and matching Cloud Code Assist project. It accepts only complete, bo
 envelopes with `error.details[].reason === "VALIDATION_REQUIRED"`; verification wording alone does
 not authorize rotation, and this path does not persist a reauthentication mark. Each physical send,
 including a 429 retry, consumes the same request budget exactly once. A disabled pool, cancellation,
-exhausted budget or unavailable sibling preserves the failure.
+exhausted budget or unavailable sibling preserves the failure. If sibling request construction or
+dispatch fails, the original bounded 403 remains the error; a replay rejected before physical
+dispatch returns its unused send allowance.
 Continuations, native Responses passthrough, image sidecars, and output already sent
 to the client do not use this rotation.
 
