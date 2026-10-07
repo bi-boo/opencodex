@@ -29,7 +29,7 @@ import {
   failoverAccountSnapshot,
 } from "../../oauth/generic-account-failover";
 import { classifyKiroRefusal } from "../../adapters/kiro-refusal";
-import { ANTIGRAVITY_VALIDATION_REQUIRED_PREFIX, safeAntigravityHttpErrorMessage } from "../../adapters/google-errors";
+import { safeAntigravityHttpErrorMessage } from "../../adapters/google-errors";
 import { markAccountNeedsReauthIfGeneration } from "../../oauth/store";
 import { noteKiroMonthlyRefusal, noteKiroServedSuccess } from "../../providers/kiro-usage";
 import { persistKiroAccountState } from "../../providers/kiro-account-state-disk";
@@ -48,6 +48,7 @@ import { recordAdapterReasoning, recordAdapterTier } from "../request-log";
 import { normalizeLogConversationId } from "../request-log-conversation";
 import { rememberResponseState } from "../../responses/state";
 import { trackStreamLifetime } from "../lifecycle";
+import { hasAntigravityValidationRefusalMarker } from "./antigravity-validation-refusal";
 
 /** One responsibility of the Responses request pipeline; state owners are explicit. */
 export async function executeResponsesSidecars(
@@ -215,8 +216,9 @@ export async function executeResponsesSidecars(
       // The structured reason is authoritative. For older upstream envelopes, accept only the
       // exact verification message in error.message; unrelated 403 text and other fields do not
       // convict an account.
-      antigravityVerification = safeAntigravityHttpErrorMessage(403, body)
-        .startsWith(`${ANTIGRAVITY_VALIDATION_REQUIRED_PREFIX}: `) || exactMessage;
+      antigravityVerification = hasAntigravityValidationRefusalMarker(
+        safeAntigravityHttpErrorMessage(403, body),
+      ) || exactMessage;
       if (!antigravityVerification) return null;
     }
     const refusal = route.providerName === "kiro" && originalResponse

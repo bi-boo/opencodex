@@ -1,6 +1,11 @@
 import { ANTIGRAVITY_VALIDATION_REQUIRED_PREFIX } from "../../adapters/google-errors";
 import { readBoundedResponseBody } from "../../lib/bounded-body";
 
+/** Match only the normalized Antigravity validation-refusal marker. */
+export function hasAntigravityValidationRefusalMarker(text: string): boolean {
+  return text.startsWith(`${ANTIGRAVITY_VALIDATION_REQUIRED_PREFIX}: `);
+}
+
 /** Inspect only the Google adapter's normalized, already bounded 403 response. */
 export async function isAntigravityValidationRefusal(response: Response, signal?: AbortSignal): Promise<boolean> {
   if (response.status !== 403 || signal?.aborted) return false;
@@ -13,7 +18,7 @@ export async function isAntigravityValidationRefusal(response: Response, signal?
       signal,
     });
     return !signal?.aborted && body.displaySafe && !body.truncated && !body.timedOut && !body.oversized
-      && body.text.startsWith(`${ANTIGRAVITY_VALIDATION_REQUIRED_PREFIX}: `);
+      && hasAntigravityValidationRefusalMarker(body.text);
   } catch {
     return false;
   }
