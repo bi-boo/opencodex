@@ -88,6 +88,10 @@ function jsonSuccessBody(text: string): Record<string, unknown> {
   };
 }
 
+function sseSuccessBody(text: string): string {
+  return `data: ${JSON.stringify(jsonSuccessBody(text))}\n\n`;
+}
+
 function transient429ErrorBody(): Record<string, unknown> {
   return {
     error: {
@@ -206,6 +210,188 @@ describe("Google Antigravity OAuth 429 retry and multi-account budget (#5880)", 
     expect(await response.text()).toContain("Antigravity account validation required");
     expect(observedSends).toEqual([{ auth: accounts[0]!.auth, project: accounts[0]!.project }]);
     expect(sendBudget.used).toBe(1);
+  });
+
+  test.each([
+    { error: { status: "PERMISSION_DENIED", message: "validate", details: [{ reason: "VALIDATION_REQUIRED" }] } },
+    { error: { status: "PERMISSION_DENIED", message: "Verify your account to continue." } },
+    { error: { status: "PERMISSION_DENIED", message: "Please verify your account to continue using Antigravity." } },
+  ])("web_search rotates only a recognized verification 403 with the sibling identity and project", async refusal => {
+    const accounts = await seedAntigravityAccounts(2);
+    const cfg = antigravityConfig();
+    cfg.webSearchSidecar = { backend: "exa", exaApiKey: "synthetic-exa-key" };
+    saveConfig(cfg);
+    const observedSends: Array<{ auth: string; project: string }> = [];
+    installAntigravityFetchMock(({ auth, project, sendIndex }) => {
+      observedSends.push({ auth, project });
+      if (sendIndex === 1) return new Response(JSON.stringify(refusal), { status: 403 });
+      return new Response(sseSuccessBody("sibling answered"), {
+        status: 200, headers: { "content-type": "text/event-stream" },
+      });
+    });
+    const sendBudget = createRequestExecutionBudget({
+      maxTotalModelSends: 2, baseSendAllowance: 2, finalRecoveryAllowance: 0,
+      maxAlternateTargetSends: 0, maxTargetTransitions: 0,
+    });
+
+    const response = await handleResponses(
+      createResponsesRequest({ tools: [{ type: "web_search" }] }),
+      cfg,
+      { model: "gemini-3.8-flash", provider: "google-antigravity" },
+      { sendBudget },
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("sibling answered");
+    expect(observedSends).toEqual([
+      { auth: accounts[0]!.auth, project: accounts[0]!.project },
+      { auth: accounts[1]!.auth, project: accounts[1]!.project },
+    ]);
+    expect(getAccountSet("google-antigravity")!.accounts.find(row => row.id === accounts[0]!.id))
+      .toMatchObject({ needsReauth: true, needsReauthReason: "verify_account" });
+    expect(sendBudget.used).toBe(2);
+  });
+
+  test("web_search leaves an unrelated 403 intact and does not quarantine the account", async () => {
+    const accounts = await seedAntigravityAccounts(2);
+    const cfg = antigravityConfig();
+    cfg.webSearchSidecar = { backend: "exa", exaApiKey: "synthetic-exa-key" };
+    saveConfig(cfg);
+    const observedSends: Array<{ auth: string; project: string }> = [];
+    installAntigravityFetchMock(({ auth, project }) => {
+      observedSends.push({ auth, project });
+      return new Response(JSON.stringify({ error: {
+        status: "PERMISSION_DENIED", message: "The requested feature is not available to this account.",
+      } }), { status: 403 });
+    });
+
+    const response = await handleResponses(
+      createResponsesRequest({ tools: [{ type: "web_search" }] }),
+      cfg,
+      { model: "gemini-3.8-flash", provider: "google-antigravity" },
+    );
+
+    expect(response.status).toBe(403);
+    expect(await response.text()).toContain("access denied");
+    expect(observedSends).toEqual([{ auth: accounts[0]!.auth, project: accounts[0]!.project }]);
+    expect(getAccountSet("google-antigravity")!.accounts.find(row => row.id === accounts[0]!.id)?.needsReauth).toBeFalsy();
+  });
+
+  test("web_search cannot spend a second send when the caller budget is exhausted", async () => {
+    const accounts = await seedAntigravityAccounts(2);
+    const cfg = antigravityConfig();
+    cfg.webSearchSidecar = { backend: "exa", exaApiKey: "synthetic-exa-key" };
+    saveConfig(cfg);
+    const observedSends: Array<{ auth: string; project: string }> = [];
+    installAntigravityFetchMock(({ auth, project }) => {
+      observedSends.push({ auth, project });
+      return new Response(JSON.stringify({ error: { status: "PERMISSION_DENIED", message: "validate",
+        details: [{ reason: "VALIDATION_REQUIRED" }] } }), { status: 403 });
+    });
+    const sendBudget = createRequestExecutionBudget({
+      maxTotalModelSends: 1, baseSendAllowance: 1, finalRecoveryAllowance: 0,
+      maxAlternateTargetSends: 0, maxTargetTransitions: 0,
+    });
+
+    const response = await handleResponses(
+      createResponsesRequest({ tools: [{ type: "web_search" }] }),
+      cfg,
+      { model: "gemini-3.8-flash", provider: "google-antigravity" },
+      { sendBudget },
+    );
+
+    expect(response.status).toBe(403);
+    expect(await response.text()).toContain("Antigravity account validation required");
+    expect(observedSends).toEqual([{ auth: accounts[0]!.auth, project: accounts[0]!.project }]);
+    expect(sendBudget.used).toBe(1);
+  });
+
+  test("web_search cancellation after the refusal sends no sibling request", async () => {
+    await seedAntigravityAccounts(2);
+    const cfg = antigravityConfig();
+    cfg.webSearchSidecar = { backend: "exa", exaApiKey: "synthetic-exa-key" };
+    saveConfig(cfg);
+    const abort = new AbortController();
+    let sends = 0;
+    installAntigravityFetchMock(() => {
+      sends += 1;
+      abort.abort();
+      return new Response(JSON.stringify({ error: { status: "PERMISSION_DENIED", message: "validate",
+        details: [{ reason: "VALIDATION_REQUIRED" }] } }), { status: 403 });
+    });
+
+    const response = await handleResponses(
+      createResponsesRequest({ tools: [{ type: "web_search" }] }),
+      cfg,
+      { model: "gemini-3.8-flash", provider: "google-antigravity" },
+      { abortSignal: abort.signal },
+    );
+
+    expect(sends).toBe(1);
+    await response.text();
+  });
+
+  test("a stale credential generation is not quarantined or replayed from the web_search path", async () => {
+    const accounts = await seedAntigravityAccounts(2);
+    const cfg = antigravityConfig();
+    cfg.webSearchSidecar = { backend: "exa", exaApiKey: "synthetic-exa-key" };
+    saveConfig(cfg);
+    const observedSends: Array<{ auth: string; project: string }> = [];
+    installAntigravityFetchMock(async ({ auth, project, sendIndex }) => {
+      observedSends.push({ auth, project });
+      if (sendIndex === 1) {
+        await saveCredential("google-antigravity", {
+          access: "relogin-token", refresh: "relogin-refresh", expires: Date.now() + 3_600_000,
+          accountId: "account-1", projectId: "project-1",
+        });
+        return new Response(JSON.stringify({ error: { status: "PERMISSION_DENIED", message: "validate",
+          details: [{ reason: "VALIDATION_REQUIRED" }] } }), { status: 403 });
+      }
+      return new Response(JSON.stringify(jsonSuccessBody("unexpected sibling")), { status: 200 });
+    });
+
+    const response = await handleResponses(
+      createResponsesRequest({ tools: [{ type: "web_search" }] }),
+      cfg,
+      { model: "gemini-3.8-flash", provider: "google-antigravity" },
+    );
+
+    expect(response.status).toBe(403);
+    await response.text();
+    expect(observedSends).toHaveLength(1);
+    const failed = getAccountSet("google-antigravity")!.accounts.find(row => row.id === accounts[0]!.id)!;
+    expect(failed.needsReauth).toBeFalsy();
+    expect(failed.needsReauthReason).toBeUndefined();
+  });
+
+  test("web_search marks the refused account but preserves the 403 when no sibling has a project", async () => {
+    const accounts = await seedAntigravityAccounts(1);
+    const cfg = antigravityConfig();
+    cfg.webSearchSidecar = { backend: "exa", exaApiKey: "synthetic-exa-key" };
+    saveConfig(cfg);
+    await saveCredential("google-antigravity", {
+      access: "no-project-token", refresh: "no-project-refresh", expires: Date.now() + 3_600_000,
+      accountId: "no-project-account",
+    }, { addAccount: true });
+    await setActiveAccount("google-antigravity", accounts[0]!.id);
+    const observedSends: Array<{ auth: string; project: string }> = [];
+    installAntigravityFetchMock(({ auth, project }) => {
+      observedSends.push({ auth, project });
+      return new Response(JSON.stringify({ error: { status: "PERMISSION_DENIED", message: "validate",
+        details: [{ reason: "VALIDATION_REQUIRED" }] } }), { status: 403 });
+    });
+
+    const response = await handleResponses(
+      createResponsesRequest({ tools: [{ type: "web_search" }] }),
+      cfg,
+      { model: "gemini-3.8-flash", provider: "google-antigravity" },
+    );
+
+    expect(response.status).toBe(403);
+    expect(await response.text()).toContain("Antigravity account validation required");
+    expect(observedSends).toEqual([{ auth: accounts[0]!.auth, project: accounts[0]!.project }]);
+    expect(getAccountSet("google-antigravity")!.accounts.find(row => row.id === accounts[0]!.id))
+      .toMatchObject({ needsReauth: true, needsReauthReason: "verify_account" });
   });
 
   test.each([4, 5])("%i accounts each receive three transient sends before terminal 429", async accountCount => {

@@ -24,10 +24,13 @@ import {
   isGenericOAuthFailoverEnabled,
   rotateGenericOAuthAccountOn429,
   rotateGenericOAuthAccountOnRefusal,
+  rotateAntigravityAccountOnAuthRefusal,
   quarantineKiroSuspendedAccount,
   failoverAccountSnapshot,
 } from "../../oauth/generic-account-failover";
 import { classifyKiroRefusal } from "../../adapters/kiro-refusal";
+import { ANTIGRAVITY_VALIDATION_REQUIRED_PREFIX, safeAntigravityHttpErrorMessage } from "../../adapters/google-errors";
+import { markAccountNeedsReauthIfGeneration } from "../../oauth/store";
 import { noteKiroMonthlyRefusal, noteKiroServedSuccess } from "../../providers/kiro-usage";
 import { persistKiroAccountState } from "../../providers/kiro-account-state-disk";
 import { readDisplaySafeErrorText } from "./core-errors";
@@ -85,7 +88,7 @@ export async function executeResponsesSidecars(
     | "notifyResponseComplete"
     | "cancelResponseCompletion"
   >,
-  sendBudgetState: Pick<ResponsesSendBudget, "reserveCredentialHop">,
+  sendBudgetState: Pick<ResponsesSendBudget, "reserveCredentialHop" | "adapterDispatchBudget" | "pendingHopPermit" | "noteAdapterPhysicalSend">,
 ) {
   const { config, options, logCtx } = requestContext;
   const {
@@ -182,13 +185,40 @@ export async function executeResponsesSidecars(
     || (logCtx.activeAttempt?.deliverySummary?.semanticBytes ?? 0) > 0
     || (logCtx.activeAttempt?.deliverySummary?.sideEffectEvents ?? 0) > 0;
   const noteSidecarOutput = () => { sidecarOutputStarted = true; options.onFirstOutput?.(); };
+  // A single request may rotate once for a verification refusal. Keep this separate from the
+  // broader OAuth failover count: a sidecar turn can also spend that count on rate-limit recovery.
+  let antigravityValidationRotationAttempted = false;
   const rotateSidecarProviderOn429 = async (
     retryAfter: string | null,
     responseHeaders?: Headers,
     retryParsed?: OcxParsedRequest,
     originalResponse?: Response,
   ): Promise<{ adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind } | null> => {
-    if (route.providerName !== "kiro" && !(route.providerName === "anthropic" && originalResponse?.status === 403) && originalResponse && originalResponse.status !== 429) return null;
+    const antigravityValidationResponse = canRunWebSearch && route.providerName === "google-antigravity"
+      && route.provider.authMode === "oauth" && originalResponse?.status === 403;
+    if (route.providerName !== "kiro" && !(route.providerName === "anthropic" && originalResponse?.status === 403)
+      && !antigravityValidationResponse && originalResponse && originalResponse.status !== 429) return null;
+    let antigravityVerification = false;
+    if (antigravityValidationResponse) {
+      if (options.abortSignal?.aborted) return null;
+      const body = await readDisplaySafeErrorText(
+        originalResponse.clone(), options.abortSignal ?? new AbortController().signal, "",
+      );
+      if (options.abortSignal?.aborted) return null;
+      let exactMessage = false;
+      try {
+        const envelope = JSON.parse(body) as { error?: { message?: unknown } };
+        const message = envelope.error?.message;
+        exactMessage = typeof message === "string"
+          && /^(?:Please )?verify your account to continue(?: using Antigravity)?[.!]?$/i.test(message.trim());
+      } catch { /* an unparseable body cannot authorize account quarantine */ }
+      // The structured reason is authoritative. For older upstream envelopes, accept only the
+      // exact verification message in error.message; unrelated 403 text and other fields do not
+      // convict an account.
+      antigravityVerification = safeAntigravityHttpErrorMessage(403, body)
+        .startsWith(`${ANTIGRAVITY_VALIDATION_REQUIRED_PREFIX}: `) || exactMessage;
+      if (!antigravityVerification) return null;
+    }
     const refusal = route.providerName === "kiro" && originalResponse
       ? classifyKiroRefusal(originalResponse.status,
         await readDisplaySafeErrorText(originalResponse.clone(), options.abortSignal ?? new AbortController().signal, "")).kind
@@ -205,6 +235,51 @@ export async function executeResponsesSidecars(
     // sidecar loops used to flatten all three to `key-429`, so an account rotation read as a key
     // rotation in the attempt row and in the Logs UI.
     let recoveryKind: AttemptRecoveryKind = "key-429";
+    if (antigravityVerification) {
+      const sent = transportState.replayOAuthCredentialSnapshot;
+      const failedAccountId = transportState.genericFailoverAccountId;
+      if (!sent || !failedAccountId || sent.accountId !== failedAccountId) return null;
+      const poolActivated = isGenericOAuthFailoverEnabled(config, route.providerName);
+      try {
+        // Fence the durable health mark to the exact credential generation sent upstream.
+        if (!await markAccountNeedsReauthIfGeneration(
+          route.providerName, sent.accountId, sent.generation, undefined, "verify_account",
+        )) return null;
+      } catch { return null; }
+      if (options.abortSignal?.aborted || !poolActivated || antigravityValidationRotationAttempted
+        || transportState.genericFailovers >= transportState.genericFailoverLimit
+        || sidecarHasCommittedOutput()) return null;
+
+      const hop = reserveCredentialHop(
+        "auth-recovery",
+        `${route.providerName}|${route.modelId}|sidecar-oauth-verify`,
+      );
+      if (!hop.allowed) return null;
+      antigravityValidationRotationAttempted = true;
+      const nextAccountId = rotateAntigravityAccountOnAuthRefusal(
+        poolActivated, sent.accountId, sent.generation, route.modelId,
+      );
+      if (!nextAccountId) {
+        hop.permit?.release();
+        return null;
+      }
+      try {
+        // Keep the sibling's bearer and its account-matched project together; never inherit the
+        // quarantined account's identity or project.
+        const snapshot = await failoverAccountSnapshot(route.providerName, nextAccountId);
+        if (options.abortSignal?.aborted || !await applyFailoverSnapshot(snapshot, retryParsed)
+          || transportState.replayOAuthCredentialSnapshot?.accountId !== nextAccountId) {
+          hop.permit?.release();
+          return null;
+        }
+        transportState.genericFailovers += 1;
+      } catch {
+        hop.permit?.release();
+        return null;
+      }
+      recoveryKind = "oauth-account-403";
+      sendBudgetState.pendingHopPermit = hop.permit;
+    }
     const rotated = !originalResponse || originalResponse.status === 429
       ? rotateProviderTransportOn429(config, route.providerName, route.provider, {
       retryAfter,
@@ -212,7 +287,9 @@ export async function executeResponsesSidecars(
       attemptedKey: route.provider.apiKey,
       promptCacheKey: parsed.options.promptCacheKey,
       }) : null;
-    if (rotated) {
+    if (antigravityVerification) {
+      // `applyFailoverSnapshot` has already rebound the route to the sibling identity/project.
+    } else if (rotated) {
       route.provider = rotated;
     } else if (
       // A POSITIVE gate, not an early return. An early `return null` here made every later arm
@@ -321,6 +398,7 @@ export async function executeResponsesSidecars(
         providerName: route.providerName,
         provider: route.provider,
         adapterName: rotatedAdapter.name,
+        ...(antigravityVerification ? { oauthCredentialSnapshot: transportState.replayOAuthCredentialSnapshot } : {}),
       });
     }
     bindRouteReasoningReplayScope({
@@ -328,6 +406,7 @@ export async function executeResponsesSidecars(
       providerName: route.providerName,
       provider: route.provider,
       adapterName: rotatedAdapter.name,
+      ...(antigravityVerification ? { oauthCredentialSnapshot: transportState.replayOAuthCredentialSnapshot } : {}),
     });
     return { adapter: rotatedAdapter, recoveryKind };
   };
@@ -484,6 +563,11 @@ export async function executeResponsesSidecars(
         abortSignal: options.abortSignal,
         translatorBudget,
         providerFetch: routedProviderFetch,
+        ...(route.providerName === "google-antigravity" ? {
+          sendBudget: sendBudgetState.adapterDispatchBudget,
+          onPhysicalSend: (send: { ordinal: number; recovery?: AttemptRecoveryKind }) =>
+            sendBudgetState.noteAdapterPhysicalSend(logCtx.usageLogInputTokens, send),
+        } : {}),
       },
       backend: wsPlan.backend,
       forwardProvider: wsPlan.forwardSidecar?.provider,
@@ -516,6 +600,13 @@ export async function executeResponsesSidecars(
       stallTimeoutSec: wsPlan.stallTimeoutSec,
       streamRoutedModelOutput: wsPlan.streamRoutedModelOutput,
       on429: rotateSidecarProviderOn429,
+      ...(route.providerName === "google-antigravity" ? { onIterationEnd: () => {
+        // The next Antigravity adapter dispatch claims this permit. If request construction,
+        // admission or cancellation stopped it first, return the unused send allowance.
+        const permit = sendBudgetState.pendingHopPermit;
+        sendBudgetState.pendingHopPermit = undefined;
+        permit?.release();
+      } } : {}),
       retryOn429Policy: route.providerName === "kiro" && isGenericOAuthFailoverEnabled(config, "kiro")
         ? null : rateLimitRetryPolicyFor(route.provider),
       onCompletedResponse: response => {

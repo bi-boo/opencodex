@@ -353,6 +353,8 @@ export interface WebSearchLoopDeps {
     | { adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind }
     | null
     | Promise<{ adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind } | null>;
+  /** Release a credential-hop permit if this iteration ended before the adapter used it. */
+  onIterationEnd?: () => void;
   /** Opt-in same-target 429 policy (key-auth providers). When present, 429 replays on the SAME key before on429 rotation. */
   retryOn429Policy?: Required<RateLimitRetryPolicy> | null;
   /** Called only when the final bridged Responses stream reaches completed or incomplete. */
@@ -501,6 +503,8 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
               timeoutMs: connectTimeoutMs,
               returnRawErrors: true,
               stream: true,
+              sendBudget: deps.incomingMeta.sendBudget,
+              onPhysicalSend: deps.incomingMeta.onPhysicalSend,
               executor: requestFetch,
             });
           } else {
@@ -571,7 +575,9 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
       // 429 key-failover parity with the normal routed path: rotate pool keys until one responds
       // or the pool is exhausted (deps.on429 returns null — cooldown map guarantees termination).
       while ((prepared.response.status === 429
-        || (prepared.response.status === 403 && deps.incomingMeta?.providerName === "anthropic" && !accountRefusalOutputStarted)
+        || (prepared.response.status === 403
+          && (deps.incomingMeta?.providerName === "anthropic" || deps.incomingMeta?.providerName === "google-antigravity")
+          && !accountRefusalOutputStarted)
         || (iterParsed._kiroAuthContext && (prepared.response.status === 400 || prepared.response.status === 403))) && deps.on429) {
         const rotated = await deps.on429(prepared.response.headers.get("retry-after"), prepared.response.headers,
           iterParsed, prepared.response);
@@ -623,6 +629,7 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
       throw new LoopError(502, `Provider unreachable: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       headerDeadline.clear();
+      deps.onIterationEnd?.();
     }
   };
 
