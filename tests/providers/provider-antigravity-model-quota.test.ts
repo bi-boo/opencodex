@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { PROXY_ENV_KEYS } from "../../src/lib/proxy-env";
 import { rankAccountsByHeadroom } from "../../src/oauth/account-quota-rank";
+import { cachedProviderQuotaIsExhausted } from "../../src/combos/resolve";
 import { getCachedProviderAccountQuota, setCachedProviderAccountQuotaForTests } from "../../src/providers/quota";
 import { sweepExpiredProviderAccountQuotaRows } from "../../src/providers/quota/account-cache";
 import { ACCOUNT_QUOTA_TTL_MS } from "../../src/providers/quota-wire";
@@ -127,5 +128,12 @@ describe("Antigravity model quota evidence", () => {
     expect(sweepExpiredProviderAccountQuotaRows(Date.now() + ACCOUNT_QUOTA_TTL_MS)).toBeGreaterThan(0);
     expect(getCachedProviderAccountQuota("google-antigravity", "first")).toBeNull();
     expect(sweepExpiredProviderAccountQuotaRows(Date.now() + ACCOUNT_QUOTA_TTL_MS)).toBe(0);
+  });
+
+  test("model-specific diagnostic rows never prove combo target exhaustion", () => {
+    expect(cachedProviderQuotaIsExhausted({
+      updatedAt: Date.now(),
+      customWindows: [{ label: "gemini-3.8-flash-high", modelId: "gemini-3.8-flash-high", percent: 100 }],
+    }, Date.now(), "gemini-3.8-flash-high")).toBe(false);
   });
 });
